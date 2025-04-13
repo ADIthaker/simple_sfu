@@ -190,6 +190,7 @@ type Peer struct {
     ID               string
     PC               *webrtc.PeerConnection
     OutTracks        map[string]*webrtc.TrackLocalStaticRTP
+    InTracks         map[string]*webrtc.TrackRemote      
     OfferChan        chan webrtc.SessionDescription
     RemoteAnswerChan chan webrtc.SessionDescription
     mu               sync.Mutex
@@ -222,6 +223,7 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
         ID:               peerID,
         PC:               pc,
         OutTracks:        make(map[string]*webrtc.TrackLocalStaticRTP),
+        InTracks:         make(map[string]*webrtc.TrackRemote),
         OfferChan:        make(chan webrtc.SessionDescription, 1),
         RemoteAnswerChan: make(chan webrtc.SessionDescription, 1),
     }
@@ -231,11 +233,96 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
     pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
         log.Printf("[%s] ICE state: %s", peerID, state.String())
     })
+    log.Print("Got Track from peer", peer.OutTracks)
 
+    // pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+    //     log.Printf("[%s] Received track: %s", peerID, track.Kind().String())
+    //     time.Sleep(200 * time.Millisecond)
+    //     go forwardTrackToPeers(peerID, track)
+    // })
     pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-        log.Printf("[%s] Received track: %s", peerID, track.Kind().String())
-        go forwardTrackToPeers(peerID, track)
+        kind := track.Kind().String()
+        log.Printf("[%s] Received track: %s", peerID, kind)
+    
+        peer.mu.Lock()
+        peer.InTracks[kind] = track
+        peer.mu.Unlock()
+    
+        // Start reading RTP packets from this track
+        go func() {
+            buf := make([]byte, 1500)
+            for {
+                n, _, err := track.Read(buf)
+                if err != nil {
+                    log.Printf("[%s] RTP read error: %v", peerID, err)
+                    return
+                }
+    
+                // Forward to all other peers from InTracks
+                peers.Range(func(_, val any) bool {
+                    other := val.(*Peer)
+                    if other.ID == peerID {
+                        return true // skip sender
+                    }
+    
+                    other.mu.Lock()
+                    defer other.mu.Unlock()
+    
+                    outTrack := other.OutTracks[kind]
+                    if outTrack == nil {
+                        // Create and attach outbound track
+                        newTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
+                        if err != nil {
+                            log.Printf("❌ Couldn't create outbound track: %v", err)
+                            return true
+                        }
+    
+                        sender, err := other.PC.AddTrack(newTrack)
+                        if err != nil {
+                            log.Printf("❌ Couldn't add track to peer %s: %v", other.ID, err)
+                            return true
+                        }
+    
+                        go func() {
+                            rtcpBuf := make([]byte, 1500)
+                            for {
+                                if _, _, err := sender.Read(rtcpBuf); err != nil {
+                                    return
+                                }
+                            }
+                        }()
+    
+                        other.OutTracks[kind] = newTrack
+    
+                        // Trigger renegotiation
+                        offer, err := other.PC.CreateOffer(nil)
+                        if err == nil && other.PC.SetLocalDescription(offer) == nil {
+                            if desc := other.PC.LocalDescription(); desc != nil {
+                                select {
+                                case other.OfferChan <- *desc:
+                                    log.Printf("📡 Sent renegotiation offer to %s", other.ID)
+                                default:
+                                    log.Printf("⚠️ OfferChan full for %s", other.ID)
+                                }
+                            }
+                        }
+                    }
+    
+                    // Write RTP packet
+                    if other.OutTracks[kind] != nil {
+                        log.Printf("Sending track from %s to %s", peerID, other.ID)
+                        _, err := other.OutTracks[kind].Write(buf[:n])
+                        if err != nil {
+                            log.Printf("⚠️ RTP forward error to %s: %v", other.ID, err)
+                        }
+                    }
+    
+                    return true
+                })
+            }
+        }()
     })
+    
 
     var offer webrtc.SessionDescription
     if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
@@ -268,6 +355,7 @@ func offerHandler(w http.ResponseWriter, r *http.Request) {
 func forwardTrackToPeers(fromPeerID string, track *webrtc.TrackRemote) {
     buf := make([]byte, 1500)
     for {
+
         n, _, err := track.Read(buf)
         if err != nil {
             log.Printf("[%s] Error reading track: %v", fromPeerID, err)
@@ -281,8 +369,12 @@ func forwardTrackToPeers(fromPeerID string, track *webrtc.TrackRemote) {
             }
 
             peer.mu.Lock()
+            log.Print("KIND OF TRACK: "+track.Kind().String())
             localTrack, ok := peer.OutTracks[track.Kind().String()]
+            log.Print("Tracks ", localTrack)
+
             if !ok {
+
                 newTrack, err := webrtc.NewTrackLocalStaticRTP(
                     track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
                 if err != nil {
