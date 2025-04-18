@@ -1,177 +1,3 @@
-// package main
-
-// import (
-// 	"encoding/json"
-// 	"fmt"
-// 	"io"
-// 	"log"
-// 	"net/http"
-// 	"sync"
-// 	"time"
-
-// 	//"github.com/pion/rtp"
-// 	"github.com/pion/webrtc/v3"
-// )
-
-// type Peer struct {
-// 	PC     *webrtc.PeerConnection
-// 	Tracks map[string]*webrtc.TrackLocalStaticRTP // e.g., video/audio
-// }
-
-// var peers sync.Map // key: *webrtc.PeerConnection, value: *Peer
-
-// func decodeSDP(r *http.Request, desc *webrtc.SessionDescription) error {
-// 	body, err := io.ReadAll(r.Body)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	return json.Unmarshal(body, desc)
-// }
-
-// func encodeSDP(w http.ResponseWriter, desc webrtc.SessionDescription) {
-// 	w.Header().Set("Content-Type", "application/json")
-// 	json.NewEncoder(w).Encode(desc)
-// }
-
-// func handleOffer(w http.ResponseWriter, r *http.Request) {
-// 	var offer webrtc.SessionDescription
-// 	if err := decodeSDP(r, &offer); err != nil {
-// 		http.Error(w, err.Error(), http.StatusBadRequest)
-// 		return
-// 	}
-
-// 	config := webrtc.Configuration{
-// 		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-// 	}
-
-// 	pc, err := webrtc.NewPeerConnection(config)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	peer := &Peer{PC: pc, Tracks: make(map[string]*webrtc.TrackLocalStaticRTP)}
-// 	peers.Store(pc, peer)
-
-// 	var remoteAddr string
-
-// 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-
-// 	// First, get the selected pair ID from the transport stat
-// 		log.Printf("ICE state: %s", state)
-// 		if state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted {
-// 			time.Sleep(300 * time.Millisecond)
-// 			stats := pc.GetStats()
-// 			var selectedCandidatePairID string
-// 			for _, stat := range stats {
-// 				if transport, ok := stat.(webrtc.TransportStats); ok {
-// 					selectedCandidatePairID = transport.SelectedCandidatePairID
-// 					break
-// 				}
-// 			}
-// 			for _, stat := range stats {
-// 				if pair, ok := stat.(webrtc.ICECandidatePairStats); ok {
-// 					if pair.ID == selectedCandidatePairID {
-// 						for _, s := range stats {
-// 							if remote, ok := s.(webrtc.ICECandidateStats); ok && remote.ID == pair.RemoteCandidateID {
-// 								remoteAddr = fmt.Sprintf("%s:%d", remote.IP, remote.Port)
-// 								log.Printf("Connected peer IP: %s", remoteAddr)
-// 								break
-// 							}
-// 						}
-// 					}
-// 				}
-// 			}
-// 		}
-// 	})
-
-// 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-// 		log.Printf("Received track: kind=%s, codec=%s", track.Kind(), track.Codec().MimeType)
-
-// 		outTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
-// 		if err != nil {
-// 			log.Printf("Failed to create outbound track: %v", err)
-// 			return
-// 		}
-
-// 		peer.Tracks[track.Kind().String()] = outTrack
-
-// 		// Add this track to all other peers
-// 		peers.Range(func(_, v interface{}) bool {
-// 			other := v.(*Peer)
-// 			if other.PC == pc {
-// 				return true
-// 			}
-
-// 			sender, err := other.PC.AddTrack(outTrack)
-// 			if err != nil {
-// 				log.Printf("Error adding track to peer: %v", err)
-// 				return true
-// 			}
-
-// 			go func() {
-// 				rtcpBuf := make([]byte, 1500)
-// 				for {
-// 					if _, _, err := sender.Read(rtcpBuf); err != nil {
-// 						return
-// 					}
-// 				}
-// 			}()
-// 			return true
-// 		})
-
-// 		// Forward packets
-// 		go func() {
-// 			buf := make([]byte, 1500)
-// 			for {
-// 				n, _, err := track.Read(buf)
-// 				if err != nil {
-// 					log.Printf("Error reading RTP: %v", err)
-// 					return
-// 				}
-
-// 				peers.Range(func(_, v interface{}) bool {
-// 					other := v.(*Peer)
-// 					if other.PC == pc {
-// 						return true
-// 					}
-// 					if t, ok := other.Tracks[track.Kind().String()]; ok {
-// 						if _, err := t.Write(buf[:n]); err != nil {
-// 							log.Printf("Error forwarding RTP: %v", err)
-// 						} else {
-// 							log.Printf("Forwarding RTP to")
-// 						}
-// 					}
-// 					return true
-// 				})
-// 			}
-// 		}()
-// 	})
-
-// 	if err := pc.SetRemoteDescription(offer); err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	answer, err := pc.CreateAnswer(nil)
-// 	if err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-// 	if err := pc.SetLocalDescription(answer); err != nil {
-// 		http.Error(w, err.Error(), http.StatusInternalServerError)
-// 		return
-// 	}
-
-// 	encodeSDP(w, *pc.LocalDescription())
-// }
-
-// func main() {
-// 	http.HandleFunc("/offer", handleOffer)
-// 	log.Println("SFU Server running on :8080")
-// 	log.Fatal(http.ListenAndServe(":8080", nil))
-// }
-
 package main
 
 import (
@@ -182,7 +8,7 @@ import (
     "net/http"
     "sync"
     "time"
-
+    "github.com/cilium/ebpf"
     "github.com/pion/webrtc/v3"
 )
 
@@ -457,6 +283,16 @@ func answerHandler(w http.ResponseWriter, r *http.Request) {
     } else {
         http.Error(w, "Peer not found", http.StatusNotFound)
     }
+}
+
+func initEBPFMap() {
+    var err error
+    var ipMap any
+    ipMap, err = ebpf.LoadPinnedMap("/sys/fs/bpf/peer_ips", nil)
+    if err != nil {
+        log.Fatalf("❌ Failed to load pinned eBPF map: %v", err)
+    }
+    log.Println("✅ Loaded eBPF map from /sys/fs/bpf/peer_ips")
 }
 
 func main() {
